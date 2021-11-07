@@ -1,0 +1,31 @@
+/A/ BehaviorBlock
+/N/ BehaviorBlock Conditions Actions Symbol OPR E F Loop Index
+/T/ | ; , FLOAT 0 1 2 3 4 x y vel_x vel_y vel_ang ang > < >= <=
+BehaviorBlock ::= Conditions ; Actions | BehaviorBlock
+BehaviorBlock ::= E | BehaviorBlock
+BehaviorBlock ::= F | BehaviorBlock
+BehaviorBlock ::= Conditions ; Actions
+E ::= Conditions ; Actions
+F ::= Conditions ; Actions
+Conditions ::= Symbol OPR FLOAT , Conditions
+Conditions ::= Symbol OPR FLOAT
+Actions ::= Loop Index , Actions
+Actions ::= Loop Index
+Loop ::= 0
+Loop ::= 1
+Loop ::= 2
+Loop ::= 3
+Loop ::= 4
+Index ::= 1
+Index ::= 2
+Index ::= 3
+Symbol ::= x
+Symbol ::= y
+Symbol ::= vel_x
+Symbol ::= vel_y
+Symbol ::= vel_ang
+Symbol ::= ang
+OPR ::= >
+OPR ::= <
+OPR ::= >=
+OPR ::= <=

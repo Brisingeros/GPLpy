@@ -1,0 +1,6 @@
+__author__ = "UPM"
+__license__ = "Apache License 2.0"
+__version__ = "1.0.0"
+__maintainer__ = "Kevin Carrasco"
+__email__ = "kevin.carrasco.bertran@alumnos.upm.es"
+__status__ = "Production"

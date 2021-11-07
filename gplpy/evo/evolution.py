@@ -10,6 +10,11 @@ from gplpy.gggp.metaderivation import MetaDerivation, EDA
 from gplpy.gggp.grammar import ProbabilisticModel
 from gplpy.gggp.derivation import Derivation, OnePointMutation, WX
 
+import pandas as pd
+import os
+
+import datetime
+
 
 class Optimization(Enum):
     min = False
@@ -31,7 +36,6 @@ class Individual:
             self.derivation = derivation_init(max_recursions)
 
         self._fitness = None
-        self.problem = problem(self, fitness_args)
         self.learning_iterations = 0
 
         # Asyncronous learning atributes
@@ -40,15 +44,22 @@ class Individual:
         self.alive = Event()
         self.learn = Semaphore(1)
         self.mature = Event()
+        self.no_learning = Event()
         self.converged = converged
         self.learning_tolerance_step = learning_tolerance_step
         self.learning_tolerance = learning_tolerance
         self.maturity_tolerance = learning_tolerance * maturity_tolerance_factor
 
+        self.ecco_factor = 0
+        self.problem = problem(self, fitness_args)
+        
+        self.no_learning.set()
+
     @property
     def fitness(self):
         # Wait until individual is mature to continue evolution
         self.mature.wait()
+        self.no_learning.wait()
         # Start a cycle of asyncronous learning
         if self.async_learning:
             self.learn.release()
@@ -93,8 +104,8 @@ class Evolution(object):
         # Fitness
         self.problem = problem
         self.fitness_args = fitness_args
-        self.last_average_fitness = float("inf") if self.optimization is Optimization.min else 0
-        self.last_tolerance_average_fitness = float("inf") if self.optimization is Optimization.min else 0
+        self.last_average_fitness = float("inf") if self.optimization == Optimization.min else float("-inf")
+        self.last_tolerance_average_fitness = float("inf") if self.optimization == Optimization.min else float("-inf")
 
         # Crossover function
         self.x = setup.crossover.crossover
@@ -126,9 +137,9 @@ class Evolution(object):
 
         # Sorting population
         if self.optimization == Optimization.max:
-            self.population.sort(key=lambda i: i.fitness, reverse=True)
+            self.population.sort(key=lambda i: (-i.fitness, i.learning_iterations))
         else:
-            self.population.sort(key=lambda i: i.fitness)
+            self.population.sort(key=lambda i: (i.fitness, i.learning_iterations))
 
     def elitist_selection(self):
         return self.population[0:self.parents_pool_size]
@@ -138,14 +149,14 @@ class Evolution(object):
         tournament = np.random.choice(self.population, size=self.parents_pool_size * battle_size, replace=False)
         # Tournament: 2 individuals battle
         if self.optimization == Optimization.min:
-            return [min(tournament[i:i + battle_size], key=lambda x: x.fitness)
+            return [min(tournament[i:i + battle_size], key=lambda x: x._fitness)
                     for i in range(0, len(tournament), battle_size)]
         else:
-            return [max(tournament[i:i + battle_size], key=lambda x: x.fitness)
+            return [max(tournament[i:i + battle_size], key=lambda x: x._fitness)
                     for i in range(0, len(tournament), battle_size)]
 
     def softmax_selection(self):
-        fitness = np.array([i.fitness for i in self.population])
+        fitness = np.array([i._fitness for i in self.population])
         fitness_std_1 = fitness/np.std(fitness)
         if self.optimization == Optimization.min:
             return np.random.choice(self.population,
@@ -175,30 +186,37 @@ class Evolution(object):
         self.population += offspring
 
     def converge(self):
-        average_fitness = sum(i.fitness for i in self.population) / len(self.population)
+        average_fitness = sum(i._fitness for i in self.population) / len(self.population)
         #Obtain improvement
-        if self.optimization is Optimization.min:
+        if self.optimization == Optimization.min:
             improvement = 1 - average_fitness / self.last_average_fitness
         else:
-            improvement = average_fitness / self.last_average_fitness - 1
+            if math.isinf(self.last_average_fitness):
+                improvement = 1.0
+            else:
+                improvement = (average_fitness - self.last_average_fitness) / abs(self.last_average_fitness)
         self.last_average_fitness = average_fitness
 
         if self.logger:
-            self.logger.log_evolution(best_fitness=float(self.population[0].fitness),
+            self.logger.log_evolution(best_fitness=float(self.population[0]._fitness),
                                       average_fitness=float(average_fitness),
                                       improvement=float(improvement))
         else:
-            print('Best individual fitness: %.2f, Average fitness: %.2f, Improvement: %.2f' % (self.population[0].fitness, average_fitness, improvement))
+            print(datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            print('Best individual fitness: %.2f, Average fitness: %.2f, Improvement: %.2f' % (self.population[0]._fitness, average_fitness, improvement))
 
         if self.optimization == Optimization.min:
-            if self.population[0].fitness == 0:
+            if self.population[0]._fitness == 0:
                 return True
 
         if not self.generation % self.tolerance_step:
-            if self.optimization is Optimization.min:
+            if self.optimization == Optimization.min:
                 tolerance_improvement = 1 - average_fitness / self.last_tolerance_average_fitness
             else:
-                tolerance_improvement = average_fitness / self.last_tolerance_average_fitness - 1
+                if math.isinf(self.last_tolerance_average_fitness):
+                    tolerance_improvement = 1.0
+                else:
+                    tolerance_improvement = (average_fitness - self.last_tolerance_average_fitness) / abs(self.last_tolerance_average_fitness)
             if tolerance_improvement < self.tolerance:
                 return True
             self.last_tolerance_average_fitness = average_fitness
@@ -209,10 +227,13 @@ class Evolution(object):
 
         for i in self.population:
             i.alive.clear()
+            #Avoid individual getting stuck
+            i.learn.release()
             i.join()
             self.learning_iterations += i.learning_iterations
 
-        return self.population[0].fitness, sum(i.fitness for i in self.population) / len(self.population), self.generation, self.learning_iterations
+
+        return self.population[0]._fitness, sum(i._fitness for i in self.population) / len(self.population), self.generation, self.learning_iterations, self.population[0].finalDerivation
 
 
 class Evolution_EDA(Evolution):
@@ -265,7 +286,502 @@ class Evolution_EDA(Evolution):
         #print("Target:  " + str(len(self.fitness_args)))
 
         return offspring
-       
+
+
+class Evolution_EDA_ECO(Evolution_EDA):
+    def __init__(self, logger, grammar, setup, problem, fitness_args=()):
+        super().__init__(logger, grammar, setup, problem, fitness_args)
+
+        self.dataframe = []
+
+    def converge(self):
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        #Obtain improvement
+        if self.optimization == Optimization.min:
+            improvement = 1 - average_fitness / self.last_average_fitness
+        else:
+            if math.isinf(self.last_average_fitness):
+                improvement = 1.0
+            else:
+                improvement = (average_fitness - self.last_average_fitness) / abs(self.last_average_fitness)
+        self.last_average_fitness = average_fitness
+
+        if self.logger:
+            self.logger.log_evolution(best_fitness=float(self.population[0]._fitness),
+                                      average_fitness=float(average_fitness),
+                                      improvement=float(improvement))
+        else:
+            self.dataframe.append([self.population[0]._fitness, average_fitness, improvement, 0.0])
+            print(datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            print('%d, Best individual fitness: %.2f, Average 1/3 fitness: %.2f, Improvement: %.2f' % (len(self.dataframe)-1, self.population[0]._fitness, average_fitness, improvement))
+
+        if self.optimization == Optimization.min:
+            if self.population[0]._fitness == 0:
+                return True
+
+        if not self.generation % self.tolerance_step:
+            if self.optimization == Optimization.min:
+                average_fitness = min([i[1] for i in self.dataframe])
+                tolerance_improvement = 1 - average_fitness / self.last_tolerance_average_fitness
+            else:
+                average_fitness = max([i[1] for i in self.dataframe])
+                if math.isinf(self.last_tolerance_average_fitness):
+                    tolerance_improvement = 1.0
+                else:
+                    tolerance_improvement = (average_fitness - self.last_tolerance_average_fitness) / abs(self.last_tolerance_average_fitness)
+            if tolerance_improvement < self.tolerance:
+                return True
+            self.last_tolerance_average_fitness = average_fitness
+        return False
+
+    def finish(self):
+        self.converged.set()
+
+        for i in self.population:
+            i.alive.clear()
+            #Avoid individual getting stuck
+            i.learn.release()
+            i.join()
+            self.learning_iterations += i.learning_iterations
+
+        
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        self.dataframe.append([self.population[0]._fitness, average_fitness, 0.0, self.learning_iterations])
+
+        return self.population[0]._fitness, sum(i._fitness for i in self.population) / len(self.population), self.generation, self.learning_iterations, self.population[0].finalDerivation, self.dataframe
+
+
+class Evolution_EDA_LPV_ECO(Evolution):
+    def __init__(self, logger, grammar, setup, problem, fitness_args=()):
+        super().__init__(logger, grammar, setup, problem, fitness_args)
+        
+        self.meta_derivation = MetaDerivation(grammar=grammar,
+                                              max_recursions=setup.max_recursions,
+                                              probabilistic_model=setup.probabilistic_model,
+                                              model_update_rate = setup.model_update_rate)
+        
+        self.exploration_rate = setup.exploration_rate
+        self.offspring_size = int(round(setup.population_size * setup.offspring_rate))
+        self.derivation_init = self.meta_derivation.new_derivation
+        
+        self.dataframe = []
+
+    def population_control(self):
+        super().population_control()
+        best = self.population[0]
+
+        ######################
+        def ecco_calc(indiv, best_indiv):
+            if hasattr(indiv, 'finalDerivation') or (indiv.learning_iterations >= best_indiv.learning_iterations):
+                indiv.ecco_factor = 0
+                return indiv
+
+            fitnesses = [indiv._fitness, best_indiv._fitness]
+            fitnesses.sort(reverse=True)
+
+            indiv.ecco_factor = min([((indiv.learning_iterations - best_indiv.learning_iterations) / (best_indiv.learning_iterations)) * ((fitnesses[0] - fitnesses[1])), 0])
+            
+            return indiv
+
+        self.population = [ecco_calc(i, best) for i in self.population]
+
+    def tournament_selection(self, battle_size=2):
+        # Random selection of 4 individuals of the population
+        tournament = np.random.choice(self.population, size=self.parents_pool_size * battle_size, replace=False)
+        # Tournament: 2 individuals battle
+        if self.optimization == Optimization.min:
+            return [min(tournament[i:i + battle_size], key=lambda x: (x._fitness - x.ecco_factor))
+                    for i in range(0, len(tournament), battle_size)]
+        else:
+            return [max(tournament[i:i + battle_size], key=lambda x: (x._fitness + x.ecco_factor))
+                    for i in range(0, len(tournament), battle_size)]
+
+    def replacement(self, offspring):
+        if self.optimization == Optimization.max:
+            self.population.sort(key=lambda i: (-(i._fitness - i.ecco_factor), i.learning_iterations))
+        else:
+            self.population.sort(key=lambda i: ((i._fitness + i.ecco_factor), i.learning_iterations))
+
+        return super().replacement(offspring)
+
+    def evolve(self):
+        self.population_control()
+
+        while not self.converge():
+            self.generation += 1
+            # Evolution
+            self.replacement(self.crossover(self.tournament_selection()))
+            # Filling up population (population initialization or immigrant population) and sorting
+            self.population_control()
+
+        return self.finish()
+
+    def crossover(self, parents):
+        offspring_derivations = self.x(meta_derivation=self.meta_derivation,
+                                       derivation_trees=[p.derivation.tree for p in parents],
+                                       offspring_size=self.offspring_size,
+                                       max_recursions=self.max_recursions,
+                                       exploration_rate=self.exploration_rate)
+
+        offspring = []
+        for d in offspring_derivations:
+            individual = Individual(derivation_init=self.derivation_init,
+                                    problem=self.problem,
+                                    fitness_args=self.fitness_args,
+                                    max_recursions=self.max_recursions,
+                                    derivation=d,
+                                    learning_tolerance_step=self.learning_tolerance_step,
+                                    learning_tolerance=self.learning_tolerance,
+                                    maturity_tolerance_factor=self.maturity_tolerance_factor,
+                                    async_learning=self.async_learning,
+                                    converged=self.converged)
+            individual.start()
+            offspring.append(individual)
+        #print(len(offspring[0].word), len(offspring[1].word))
+        #print("Target:  " + str(len(self.fitness_args)))
+
+        return offspring
+
+    def converge(self):
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        #Obtain improvement
+        if self.optimization == Optimization.min:
+            improvement = 1 - average_fitness / self.last_average_fitness
+        else:
+            if math.isinf(self.last_average_fitness):
+                improvement = 1.0
+            else:
+                improvement = (average_fitness - self.last_average_fitness) / abs(self.last_average_fitness)
+        self.last_average_fitness = average_fitness
+
+        if self.logger:
+            self.logger.log_evolution(best_fitness=float(self.population[0]._fitness),
+                                      average_fitness=float(average_fitness),
+                                      improvement=float(improvement))
+        else:
+            self.dataframe.append([self.population[0]._fitness, average_fitness, improvement, 0.0])
+            print(datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            print('%d, Best individual fitness: %.2f, Average 1/3 fitness: %.2f, Improvement: %.2f' % (len(self.dataframe)-1, self.population[0]._fitness, average_fitness, improvement))
+
+        if self.optimization == Optimization.min:
+            if self.population[0]._fitness == 0:
+                return True
+
+        if not self.generation % self.tolerance_step:
+            if self.optimization == Optimization.min:
+                average_fitness = min([i[1] for i in self.dataframe])
+                tolerance_improvement = 1 - average_fitness / self.last_tolerance_average_fitness
+            else:
+                average_fitness = max([i[1] for i in self.dataframe])
+                if math.isinf(self.last_tolerance_average_fitness):
+                    tolerance_improvement = 1.0
+                else:
+                    tolerance_improvement = (average_fitness - self.last_tolerance_average_fitness) / abs(self.last_tolerance_average_fitness)
+            if tolerance_improvement < self.tolerance:
+                return True
+            self.last_tolerance_average_fitness = average_fitness
+        return False
+
+
+    def finish(self):
+        self.converged.set()
+
+        for i in self.population:
+            i.alive.clear()
+            #Avoid individual getting stuck
+            i.learn.release()
+            i.join()
+            self.learning_iterations += i.learning_iterations
+
+        
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        self.dataframe.append([self.population[0]._fitness, average_fitness, 0.0, self.learning_iterations])
+        
+        return self.population[0]._fitness, sum(i._fitness for i in self.population) / len(self.population), self.generation, self.learning_iterations, self.population[0].finalDerivation, self.dataframe
+
+
+class Evolution_EDA_LP_ECO(Evolution):
+    def __init__(self, logger, grammar, setup, problem, fitness_args=()):
+        super().__init__(logger, grammar, setup, problem, fitness_args)
+        
+        self.meta_derivation = MetaDerivation(grammar=grammar,
+                                              max_recursions=setup.max_recursions,
+                                              probabilistic_model=setup.probabilistic_model,
+                                              model_update_rate = setup.model_update_rate)
+        
+        self.exploration_rate = setup.exploration_rate
+        self.offspring_size = int(round(setup.population_size * setup.offspring_rate))
+        self.derivation_init = self.meta_derivation.new_derivation
+        
+        self.dataframe = []
+
+    def population_control(self):
+        super().population_control()
+        best = self.population[0]
+
+        ######################
+        def ecco_calc(indiv, best_indiv):
+            if hasattr(indiv, 'finalDerivation') or (indiv.learning_iterations >= best_indiv.learning_iterations):
+                indiv.ecco_factor = 0
+                return indiv
+
+            fitnesses = [indiv._fitness, best_indiv._fitness]
+            fitnesses.sort(reverse=True)
+
+            indiv.ecco_factor = min([((indiv.learning_iterations - best_indiv.learning_iterations) / (best_indiv.learning_iterations)) * ((fitnesses[0] - fitnesses[1])), 0])
+            
+            return indiv
+
+        self.population = [ecco_calc(i, best) for i in self.population]
+
+    def tournament_selection(self, battle_size=2):
+        # Random selection of 4 individuals of the population
+        tournament = np.random.choice(self.population, size=self.parents_pool_size * battle_size, replace=False)
+        # Tournament: 2 individuals battle
+        if self.optimization == Optimization.min:
+            return [min(tournament[i:i + battle_size], key=lambda x: (x._fitness))
+                    for i in range(0, len(tournament), battle_size)]
+        else:
+            return [max(tournament[i:i + battle_size], key=lambda x: (x._fitness))
+                    for i in range(0, len(tournament), battle_size)]
+
+    def replacement(self, offspring):
+        if self.optimization == Optimization.max:
+            self.population.sort(key=lambda i: (-(i._fitness - i.ecco_factor), i.learning_iterations))
+        else:
+            self.population.sort(key=lambda i: ((i._fitness + i.ecco_factor), i.learning_iterations))
+
+        return super().replacement(offspring)
+
+    def evolve(self):
+        self.population_control()
+
+        while not self.converge():
+            self.generation += 1
+            # Evolution
+            self.replacement(self.crossover(self.tournament_selection()))
+            # Filling up population (population initialization or immigrant population) and sorting
+            self.population_control()
+
+        return self.finish()
+
+    def crossover(self, parents):
+        offspring_derivations = self.x(meta_derivation=self.meta_derivation,
+                                       derivation_trees=[p.derivation.tree for p in parents],
+                                       offspring_size=self.offspring_size,
+                                       max_recursions=self.max_recursions,
+                                       exploration_rate=self.exploration_rate)
+
+        offspring = []
+        for d in offspring_derivations:
+            individual = Individual(derivation_init=self.derivation_init,
+                                    problem=self.problem,
+                                    fitness_args=self.fitness_args,
+                                    max_recursions=self.max_recursions,
+                                    derivation=d,
+                                    learning_tolerance_step=self.learning_tolerance_step,
+                                    learning_tolerance=self.learning_tolerance,
+                                    maturity_tolerance_factor=self.maturity_tolerance_factor,
+                                    async_learning=self.async_learning,
+                                    converged=self.converged)
+            individual.start()
+            offspring.append(individual)
+        #print(len(offspring[0].word), len(offspring[1].word))
+        #print("Target:  " + str(len(self.fitness_args)))
+
+        return offspring
+
+    def converge(self):
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        #Obtain improvement
+        if self.optimization == Optimization.min:
+            improvement = 1 - average_fitness / self.last_average_fitness
+        else:
+            if math.isinf(self.last_average_fitness):
+                improvement = 1.0
+            else:
+                improvement = (average_fitness - self.last_average_fitness) / abs(self.last_average_fitness)
+        self.last_average_fitness = average_fitness
+
+        if self.logger:
+            self.logger.log_evolution(best_fitness=float(self.population[0]._fitness),
+                                      average_fitness=float(average_fitness),
+                                      improvement=float(improvement))
+        else:
+            self.dataframe.append([self.population[0]._fitness, average_fitness, improvement, 0.0])
+            print(datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            print('%d, Best individual fitness: %.2f, Average 1/3 fitness: %.2f, Improvement: %.2f' % (len(self.dataframe)-1, self.population[0]._fitness, average_fitness, improvement))
+
+        if self.optimization == Optimization.min:
+            if self.population[0]._fitness == 0:
+                return True
+
+        if not self.generation % self.tolerance_step:
+            if self.optimization == Optimization.min:
+                average_fitness = min([i[1] for i in self.dataframe])
+                tolerance_improvement = 1 - average_fitness / self.last_tolerance_average_fitness
+            else:
+                average_fitness = max([i[1] for i in self.dataframe])
+                if math.isinf(self.last_tolerance_average_fitness):
+                    tolerance_improvement = 1.0
+                else:
+                    tolerance_improvement = (average_fitness - self.last_tolerance_average_fitness) / abs(self.last_tolerance_average_fitness)
+            if tolerance_improvement < self.tolerance:
+                return True
+            self.last_tolerance_average_fitness = average_fitness
+        return False
+
+
+    def finish(self):
+        self.converged.set()
+
+        for i in self.population:
+            i.alive.clear()
+            #Avoid individual getting stuck
+            i.learn.release()
+            i.join()
+            self.learning_iterations += i.learning_iterations
+
+        
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        self.dataframe.append([self.population[0]._fitness, average_fitness, 0.0, self.learning_iterations])
+        
+        return self.population[0]._fitness, sum(i._fitness for i in self.population) / len(self.population), self.generation, self.learning_iterations, self.population[0].finalDerivation, self.dataframe
+
+
+class Evolution_EDA_FP_ECO(Evolution):
+    def __init__(self, logger, grammar, setup, problem, fitness_args=()):
+        super().__init__(logger, grammar, setup, problem, fitness_args)
+        
+        self.meta_derivation = MetaDerivation(grammar=grammar,
+                                              max_recursions=setup.max_recursions,
+                                              probabilistic_model=setup.probabilistic_model,
+                                              model_update_rate = setup.model_update_rate)
+        
+        self.exploration_rate = setup.exploration_rate
+        self.offspring_size = int(round(setup.population_size * setup.offspring_rate))
+        self.derivation_init = self.meta_derivation.new_derivation
+        
+        self.dataframe = []
+
+    def population_control(self):
+        super().population_control()
+
+    def tournament_selection(self, battle_size=2):
+        # Random selection of 4 individuals of the population
+        tournament = np.random.choice(self.population, size=self.parents_pool_size * battle_size, replace=False)
+        # Tournament: 2 individuals battle
+        if self.optimization == Optimization.min:
+            return [min(tournament[i:i + battle_size], key=lambda x: (x._fitness))
+                    for i in range(0, len(tournament), battle_size)]
+        else:
+            return [max(tournament[i:i + battle_size], key=lambda x: (x._fitness))
+                    for i in range(0, len(tournament), battle_size)]
+
+    def replacement(self, offspring):
+        if self.optimization == Optimization.max:
+            self.population.sort(key=lambda i: (-(i._fitness + ( (1 / ((0.05*i.learning_iterations)+1.0) ) * (i._fitness - best._fitness))), i.learning_iterations))
+        else:
+            best = self.population[0]
+            self.population.sort(key=lambda i: ((i._fitness - ( (1 / ((0.05*i.learning_iterations)+1.0) ) * (i._fitness - best._fitness))), i.learning_iterations))
+
+        return super().replacement(offspring)
+
+    def evolve(self):
+        self.population_control()
+
+        while not self.converge():
+            self.generation += 1
+            # Evolution
+            self.replacement(self.crossover(self.tournament_selection()))
+            # Filling up population (population initialization or immigrant population) and sorting
+            self.population_control()
+
+        return self.finish()
+
+    def crossover(self, parents):
+        offspring_derivations = self.x(meta_derivation=self.meta_derivation,
+                                       derivation_trees=[p.derivation.tree for p in parents],
+                                       offspring_size=self.offspring_size,
+                                       max_recursions=self.max_recursions,
+                                       exploration_rate=self.exploration_rate)
+
+        offspring = []
+        for d in offspring_derivations:
+            individual = Individual(derivation_init=self.derivation_init,
+                                    problem=self.problem,
+                                    fitness_args=self.fitness_args,
+                                    max_recursions=self.max_recursions,
+                                    derivation=d,
+                                    learning_tolerance_step=self.learning_tolerance_step,
+                                    learning_tolerance=self.learning_tolerance,
+                                    maturity_tolerance_factor=self.maturity_tolerance_factor,
+                                    async_learning=self.async_learning,
+                                    converged=self.converged)
+            individual.start()
+            offspring.append(individual)
+        #print(len(offspring[0].word), len(offspring[1].word))
+        #print("Target:  " + str(len(self.fitness_args)))
+
+        return offspring
+
+    def converge(self):
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        #Obtain improvement
+        if self.optimization == Optimization.min:
+            improvement = 1 - average_fitness / self.last_average_fitness
+        else:
+            if math.isinf(self.last_average_fitness):
+                improvement = 1.0
+            else:
+                improvement = (average_fitness - self.last_average_fitness) / abs(self.last_average_fitness)
+        self.last_average_fitness = average_fitness
+
+        if self.logger:
+            self.logger.log_evolution(best_fitness=float(self.population[0]._fitness),
+                                      average_fitness=float(average_fitness),
+                                      improvement=float(improvement))
+        else:
+            self.dataframe.append([self.population[0]._fitness, average_fitness, improvement, 0.0])
+            print(datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            print('%d, Best individual fitness: %.2f, Average 1/3 fitness: %.2f, Improvement: %.2f' % (len(self.dataframe)-1, self.population[0]._fitness, average_fitness, improvement))
+
+        if self.optimization == Optimization.min:
+            if self.population[0]._fitness == 0:
+                return True
+
+        if not self.generation % self.tolerance_step:
+            if self.optimization == Optimization.min:
+                average_fitness = min([i[1] for i in self.dataframe])
+                tolerance_improvement = 1 - average_fitness / self.last_tolerance_average_fitness
+            else:
+                average_fitness = max([i[1] for i in self.dataframe])
+                if math.isinf(self.last_tolerance_average_fitness):
+                    tolerance_improvement = 1.0
+                else:
+                    tolerance_improvement = (average_fitness - self.last_tolerance_average_fitness) / abs(self.last_tolerance_average_fitness)
+            if tolerance_improvement < self.tolerance:
+                return True
+            self.last_tolerance_average_fitness = average_fitness
+        return False
+
+
+    def finish(self):
+        self.converged.set()
+
+        for i in self.population:
+            i.alive.clear()
+            #Avoid individual getting stuck
+            i.learn.release()
+            i.join()
+            self.learning_iterations += i.learning_iterations
+
+        
+        average_fitness = sum(i._fitness for i in self.population[:(len(self.population)//3)]) / (len(self.population)//3)
+        self.dataframe.append([self.population[0]._fitness, average_fitness, 0.0, self.learning_iterations])
+        
+        return self.population[0]._fitness, sum(i._fitness for i in self.population) / len(self.population), self.generation, self.learning_iterations, self.population[0].finalDerivation, self.dataframe
+
 
 class Evolution_WX(Evolution):
     def __init__(self, logger, grammar, setup, problem, fitness_args=()):
@@ -351,7 +867,18 @@ class Experiment:
                                 setup = s, 
                                )
 
-                fit, avg_git, it, l_it = e.evolve()
+                fit, avg_git, it, l_it, final_derivation, df = e.evolve()
+
+                # #######################
+                # f = open(f'{str(self.experiment)}_{s.name}_{s.maturity_tolerance_factor}_{x}.py', "w")
+                # f.write(final_derivation)
+                # f.close()
+                # #######################
+
+                (pd.DataFrame(df, columns=['best_fitness', 'avg_3_fitness', 'improvement', 'learning_iterations'])).to_csv(f'{os.getcwd()}\EXP\{s.maturity_tolerance_factor}\{s.name}_{x}.csv')
+
+                #######################
+
                 if self.logger:
                     self.logger.log_experiment(float(fit), it, l_it)
                 else:

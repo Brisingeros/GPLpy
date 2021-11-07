@@ -1,0 +1,13 @@
+/A/ S
+/N/ S OPR OPERAND OPERATION
+# /V/ n(float,-100,100) k
+/T/ [ ] ( ) , + - * observation[INDEX] FLOAT
+S ::= [ ( OPERATION ) , ( OPERATION ) ]
+OPR ::= +
+OPR ::= -
+OPR ::= *
+OPERAND ::= observation[INDEX]
+OPERAND ::= FLOAT
+OPERATION ::= ( OPERATION ) OPR ( OPERATION )
+OPERATION ::= OPERAND
+OPERATION ::= OPERAND OPR OPERAND
